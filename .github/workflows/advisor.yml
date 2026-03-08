@@ -20,7 +20,7 @@ jobs:
           python-version: '3.11'
 
       - name: 依存パッケージをインストール
-        run: pip install requests gspread google-auth
+        run: pip install -r requirements.txt
 
       - name: 分析実行
         env:
