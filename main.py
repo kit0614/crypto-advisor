@@ -290,12 +290,27 @@ def analyze_with_claude(positions_with_pnl: list, prices: dict) -> tuple:
 
 【回答形式（厳守）】
 1. 各ポジション判断（利確/ナンピン/損切り/維持を明示、根拠1行）
-2. 新規推奨ペア2〜3個（必ず以下の形式を含めること）
+
+2. 新規エントリー推奨（★厳格フィルター★）
+   以下の条件を【すべて】満たすペアのみ推奨すること。
+   1つでも満たさなければ「現在エントリー推奨なし」と明記してRECOMMENDを出力しないこと。
+
+   【エントリー条件（全AND）】
+   A. 相場環境：BTC/ETH/SOL/BNBが全体的にアルトより強い局面である
+      → アルト全面高・BTC下落局面では推奨禁止
+   B. ショート候補が明確に弱い根拠がある
+      → 「なんとなく弱そう」は禁止。セクター・ファンダ・需給で具体的に説明できること
+   C. 既存ポジションと同じSHORT銘柄のペアは追加しない（集中リスク回避）
+   D. ゾンビ銘柄({zombie_list})をショートに使わない
+
+   条件を満たすペアがあれば以下の形式で出力（最大2個まで）：
    RECOMMEND: LONG=BTC SHORT=DOT
-   RECOMMEND: LONG=ETH SHORT=ARB
-   ※ゾンビ銘柄をショートに含めないこと
-   ※推奨理由も1行で記載
-3. 相場観（3行以内）
+   ※推奨理由を1行で（具体的な根拠を必ず含めること）
+
+   条件を満たさない場合：
+   「⛔ 現在エントリー推奨なし：[理由を1行で]」と明記する
+
+3. 相場観（3行以内、エントリーの有無の判断根拠を含めること）
 
 日本語・スマホで読みやすく・絵文字適度に。"""
 
@@ -419,11 +434,11 @@ def run_backtest_for_pair(long_sym: str, short_sym: str) -> Optional[dict]:
     ratios = [short_prices[d] / long_prices[d] for d in common_dates]
     n      = len(ratios)
 
-    # グリッドサーチ
+    # グリッドサーチ（平均保有日数も計測）
     results = []
     MAX_HOLD = 30
     for tp, sl in itertools.product(TP_RANGE, SL_RANGE):
-        trades = []
+        trades = []   # (pnl, hold_days)
         i = 0
         while i < n - 1:
             entry_r  = ratios[i]
@@ -437,14 +452,19 @@ def run_backtest_for_pair(long_sym: str, short_sym: str) -> Optional[dict]:
                     hold   = j - i
                     exit_r = cur
                     break
-            trades.append(-(exit_r - entry_r) / entry_r * POSITION_SIZE)
+            pnl = -(exit_r - entry_r) / entry_r * POSITION_SIZE
+            trades.append((pnl, hold))
             i += hold + 1
 
         if not trades:
             continue
-        total = round(sum(trades), 2)
-        wr    = round(sum(1 for x in trades if x > 0) / len(trades) * 100, 1)
-        results.append({"tp": tp, "sl": sl, "pnl": total, "wr": wr, "count": len(trades)})
+        pnls      = [t[0] for t in trades]
+        hold_days = [t[1] for t in trades]
+        total     = round(sum(pnls), 2)
+        wr        = round(sum(1 for x in pnls if x > 0) / len(pnls) * 100, 1)
+        avg_hold  = round(sum(hold_days) / len(hold_days), 1)
+        results.append({"tp": tp, "sl": sl, "pnl": total, "wr": wr,
+                        "count": len(trades), "avg_hold": avg_hold})
 
     if not results:
         return None
@@ -454,7 +474,8 @@ def run_backtest_for_pair(long_sym: str, short_sym: str) -> Optional[dict]:
     return {
         "best_tp": best["tp"], "best_sl": best["sl"],
         "best_pnl": best["pnl"], "best_wr": best["wr"],
-        "best_count": best["count"], "top10": results[:10],
+        "best_count": best["count"], "best_avg_hold": best["avg_hold"],
+        "top10": results[:10],
     }
 
 
@@ -475,13 +496,14 @@ def write_backtest_result(long_sym: str, short_sym: str, result: dict):
         except gspread.exceptions.WorksheetNotFound:
             ws = sh.add_worksheet(title=BACKTEST_SHEET, rows=500, cols=10)
             ws.append_row(["実行日時", "LONG", "SHORT",
-                           "最適利確%", "最適損切%", "過去勝率%", "総損益($)", "取引回数"])
+                           "最適利確%", "最適損切%", "過去勝率%", "総損益($)", "取引回数", "平均保有日数"])
 
         ws.append_row([
             dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
             long_sym, short_sym,
             result["best_tp"], result["best_sl"],
             result["best_wr"], result["best_pnl"], result["best_count"],
+            result.get("best_avg_hold", ""),
         ])
         print(f"  スプレッドシート書き込み完了: {long_sym}/{short_sym}")
     except Exception as e:
@@ -494,14 +516,16 @@ def write_backtest_result(long_sym: str, short_sym: str, result: dict):
 def format_backtest_message(long_sym: str, short_sym: str, result: dict) -> str:
     top10_lines = ""
     for rank, r in enumerate(result["top10"], 1):
+        avg_h = r.get("avg_hold", "?")
         top10_lines += (
             f"  {rank:2}位 TP{r['tp']}% SL{r['sl']}%"
-            f" 勝率{r['wr']}% ${r['pnl']} ({r['count']}回)\n"
+            f" 勝率{r['wr']}% ${r['pnl']} {r['count']}回 avg{avg_h}日\n"
         )
     return (
         f"\n📊 {long_sym}L/{short_sym}S（過去{BACKTEST_DAYS}日）\n"
         f"  🏆 最適: 利確{result['best_tp']}% / 損切{result['best_sl']}%\n"
-        f"  勝率:{result['best_wr']}% 総損益:${result['best_pnl']} {result['best_count']}回\n"
+        f"  勝率:{result['best_wr']}% 総損益:${result['best_pnl']}"
+        f" {result['best_count']}回 平均保有:{result.get('best_avg_hold','?')}日\n"
         f"  ─ Top10 ─\n"
         f"{top10_lines}"
     )
