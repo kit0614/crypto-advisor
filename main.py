@@ -335,24 +335,64 @@ def analyze_with_claude(positions_with_pnl: list, prices: dict) -> tuple:
 # ⑤ バックテスト（日次データ取得 + グリッドサーチ）
 # ==============================================================
 def fetch_daily_prices_for_bt(symbol: str, days: int) -> Optional[dict]:
-    """日次終値を {date: price} で返す"""
+    """
+    日次終値を {date: price} で返す
+    【改良点】
+    - リトライ回数を3→5回に増加
+    - 429(レート制限)は長めに待機（60秒）
+    - 5xx系サーバーエラーも個別ハンドリング
+    - 取得成功時にデータ件数をログ出力
+    """
     cg_id = SYMBOL_TO_CG_ID.get(symbol.upper())
     if not cg_id:
+        print(f"  {symbol}: CoinGecko IDが未登録")
         return None
+
     url    = f"{COINGECKO_BASE}/coins/{cg_id}/market_chart"
     params = {"vs_currency": "usd", "days": days, "interval": "daily"}
-    for attempt in range(3):
+
+    for attempt in range(5):
         try:
-            r = requests.get(url, params=params, timeout=30,
+            r = requests.get(url, params=params, timeout=45,
                              headers={"Accept": "application/json"})
+
+            # レート制限（429）は長めに待機してリトライ
+            if r.status_code == 429:
+                wait = 60 + attempt * 15
+                print(f"  {symbol} レート制限(429) → {wait}秒待機してリトライ({attempt+1}/5)")
+                time.sleep(wait)
+                continue
+
+            # サーバーエラー（5xx）は短め待機でリトライ
+            if r.status_code >= 500:
+                wait = 15 + attempt * 10
+                print(f"  {symbol} サーバーエラー({r.status_code}) → {wait}秒待機({attempt+1}/5)")
+                time.sleep(wait)
+                continue
+
             r.raise_for_status()
-            return {
+            price_data = r.json().get("prices", [])
+
+            if not price_data:
+                print(f"  {symbol}: 価格データが空（attempt {attempt+1}/5）")
+                time.sleep(10)
+                continue
+
+            result = {
                 dt.datetime.utcfromtimestamp(p[0] / 1000).date(): p[1]
-                for p in r.json().get("prices", [])
+                for p in price_data
             }
+            print(f"  {symbol}: {len(result)}日分取得成功")
+            return result
+
+        except requests.exceptions.Timeout:
+            print(f"  {symbol} タイムアウト({attempt+1}/5) → 15秒待機")
+            time.sleep(15)
         except Exception as e:
-            print(f"  {symbol}取得失敗({attempt+1}/3): {e}")
-            time.sleep(8)
+            print(f"  {symbol} 取得失敗({attempt+1}/5): {type(e).__name__}: {e}")
+            time.sleep(10 + attempt * 5)
+
+    print(f"  {symbol}: 5回リトライ失敗、スキップ")
     return None
 
 
@@ -363,9 +403,9 @@ def run_backtest_for_pair(long_sym: str, short_sym: str) -> Optional[dict]:
     """
     print(f"  {long_sym}/{short_sym} データ取得中...")
     long_prices  = fetch_daily_prices_for_bt(long_sym,  BACKTEST_DAYS + 5)
-    time.sleep(4)
+    time.sleep(8)   # レート制限対策：長め待機
     short_prices = fetch_daily_prices_for_bt(short_sym, BACKTEST_DAYS + 5)
-    time.sleep(4)
+    time.sleep(8)
 
     if not long_prices or not short_prices:
         print(f"  {long_sym}/{short_sym} データ取得失敗")
@@ -524,11 +564,51 @@ def main():
     else:
         bt_section = "\n⚠️ 推奨ペアの自動抽出ができませんでした\n"
 
-    # 6. Telegram通知
+    # 6. 価格スナップショット生成
+    # ポジション保有銘柄と推奨ペア銘柄を優先表示、その後LONGロング候補を表示
+    position_syms = []
+    for p in positions_with_pnl:
+        for sym in [p["long_sym"], p["short_sym"]]:
+            if sym and sym not in position_syms:
+                position_syms.append(sym)
+
+    recommend_syms = []
+    for pair in recommend_pairs:
+        for sym in [pair["long"], pair["short"]]:
+            if sym and sym not in recommend_syms and sym not in position_syms:
+                recommend_syms.append(sym)
+
+    # スナップショット表示：保有銘柄 → 推奨銘柄 → LONGロング候補
+    snapshot_lines = []
+    if position_syms:
+        snapshot_lines.append("【保有中】")
+        for sym in position_syms:
+            price = prices.get(sym)
+            snapshot_lines.append(f"  {sym}: ${price:,.4f}" if price else f"  {sym}: 取得不可")
+
+    if recommend_syms:
+        snapshot_lines.append("【推奨候補】")
+        for sym in recommend_syms:
+            price = prices.get(sym)
+            snapshot_lines.append(f"  {sym}: ${price:,.4f}" if price else f"  {sym}: 取得不可")
+
+    snapshot_lines.append("【主要銘柄】")
+    for sym in LONG_CANDIDATES:
+        if sym not in position_syms and sym not in recommend_syms:
+            price = prices.get(sym)
+            snapshot_lines.append(f"  {sym}: ${price:,.2f}" if price else f"  {sym}: 取得不可")
+
+    price_snapshot = "\n".join(snapshot_lines)
+
+    # 7. Telegram通知
     message = (
         f"🤖 相関両建てアドバイザー\n"
-        f"🕐 {now}\n"
+        f"🕐 取得時刻: {now}\n"
+        f"⚠️ 通知遅延がある場合は上記時刻を基準にしてください\n"
         f"📊 オープンポジション: {len(positions)}件\n"
+        f"━━━━━━━━━━━━\n"
+        f"💹 価格スナップショット（取得時刻基準）\n"
+        f"{price_snapshot}\n"
         f"━━━━━━━━━━━━\n"
         f"{claude_text}\n"
         f"━━━━━━━━━━━━\n"
