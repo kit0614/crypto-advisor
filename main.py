@@ -413,69 +413,140 @@ def fetch_daily_prices_for_bt(symbol: str, days: int) -> Optional[dict]:
 
 def run_backtest_for_pair(long_sym: str, short_sym: str) -> Optional[dict]:
     """
-    1ペアのバックテストを実行してグリッドサーチ結果を返す
-    戻り値: {best_tp, best_sl, best_pnl, best_wr, best_count, top10}
+    1ペアのバックテストを実行。
+    TP × SL × エントリー条件 の全組み合わせをグリッドサーチ。
+
+    エントリー条件7種:
+      always      : 無条件（前トレード終了後に即エントリー）
+      ma_above_5  : 現在レシオ > 5日MA  （ショートが相対的に割高）
+      ma_above_10 : 現在レシオ > 10日MA
+      ma_above_20 : 現在レシオ > 20日MA
+      ma_below_5  : 現在レシオ < 5日MA  （ロングが相対的に強い ← 理論的に有利）
+      ma_below_10 : 現在レシオ < 10日MA
+      ma_below_20 : 現在レシオ < 20日MA
+
+    戻り値: {best_*, top10: [{tp,sl,entry_cond,pnl,wr,count,avg_hold}, ...]}
     """
     print(f"  {long_sym}/{short_sym} データ取得中...")
-    long_prices  = fetch_daily_prices_for_bt(long_sym,  BACKTEST_DAYS + 5)
-    time.sleep(8)   # レート制限対策：長め待機
-    short_prices = fetch_daily_prices_for_bt(short_sym, BACKTEST_DAYS + 5)
+    long_prices  = fetch_daily_prices_for_bt(long_sym,  BACKTEST_DAYS + 30)  # MA計算のため余裕を持たせる
+    time.sleep(8)
+    short_prices = fetch_daily_prices_for_bt(short_sym, BACKTEST_DAYS + 30)
     time.sleep(8)
 
     if not long_prices or not short_prices:
         print(f"  {long_sym}/{short_sym} データ取得失敗")
         return None
 
-    common_dates = sorted(set(long_prices) & set(short_prices))[-BACKTEST_DAYS:]
-    if len(common_dates) < 30:
+    common_dates = sorted(set(long_prices) & set(short_prices))
+    if len(common_dates) < 50:   # MA20 + 最低30日の余裕
         print(f"  {long_sym}/{short_sym} データ不足({len(common_dates)}日)")
         return None
 
-    ratios = [short_prices[d] / long_prices[d] for d in common_dates]
-    n      = len(ratios)
+    # 直近BACKTEST_DAYS日を対象期間とする
+    target_dates = common_dates[-BACKTEST_DAYS:]
+    all_dates    = common_dates  # MA計算用（より古いデータも使う）
 
-    # グリッドサーチ（平均保有日数も計測）
-    results = []
+    ratios_all = [short_prices[d] / long_prices[d] for d in all_dates]
+    # target_datesに対応するインデックスのオフセット
+    offset = len(all_dates) - len(target_dates)
+
+    # MA計算（all_datesベース）
+    def get_ma(idx_in_all: int, window: int) -> Optional[float]:
+        """idx_in_all時点でのwindow日移動平均。データ不足ならNone"""
+        start = idx_in_all - window + 1
+        if start < 0:
+            return None
+        return sum(ratios_all[start:idx_in_all + 1]) / window
+
+    # エントリー条件の定義
+    # (条件名, 判定関数(ratio, ma) -> bool, MAウィンドウ)
+    ENTRY_CONDITIONS = [
+        ("always",      lambda r, ma: True,  None),
+        ("ma_above_5",  lambda r, ma: ma is not None and r > ma,  5),
+        ("ma_above_10", lambda r, ma: ma is not None and r > ma, 10),
+        ("ma_above_20", lambda r, ma: ma is not None and r > ma, 20),
+        ("ma_below_5",  lambda r, ma: ma is not None and r < ma,  5),
+        ("ma_below_10", lambda r, ma: ma is not None and r < ma, 10),
+        ("ma_below_20", lambda r, ma: ma is not None and r < ma, 20),
+    ]
+
+    ratios = ratios_all[offset:]   # target_dates に対応するレシオ列
+    n      = len(ratios)
     MAX_HOLD = 30
-    for tp, sl in itertools.product(TP_RANGE, SL_RANGE):
+
+    results = []
+    total_patterns = len(TP_RANGE) * len(SL_RANGE) * len(ENTRY_CONDITIONS)
+    print(f"  グリッドサーチ: {total_patterns}パターン")
+
+    for (cond_name, cond_fn, ma_window), tp, sl in itertools.product(
+            ENTRY_CONDITIONS, TP_RANGE, SL_RANGE):
+
         trades = []   # (pnl, hold_days)
         i = 0
         while i < n - 1:
+            # エントリー条件チェック
+            idx_in_all = offset + i
+            ma = get_ma(idx_in_all, ma_window) if ma_window else None
+            current_ratio = ratios[i]
+
+            if not cond_fn(current_ratio, ma):
+                i += 1   # 条件不成立 → 翌日へ
+                continue
+
+            # エントリー成立 → TP/SL到達まで保有
             entry_r  = ratios[i]
             tp_level = entry_r * (1 - tp / 100)
             sl_level = entry_r * (1 + sl / 100)
             hold     = min(MAX_HOLD, n - 1 - i)
             exit_r   = ratios[min(i + MAX_HOLD, n - 1)]
+
             for j in range(i + 1, min(i + 1 + MAX_HOLD, n)):
                 cur = ratios[j]
                 if cur <= tp_level or cur >= sl_level:
                     hold   = j - i
                     exit_r = cur
                     break
+
             pnl = -(exit_r - entry_r) / entry_r * POSITION_SIZE
             trades.append((pnl, hold))
-            i += hold + 1
+            i += hold + 1   # 決済翌日から次のエントリー機会を探す
 
-        if not trades:
+        if len(trades) < 5:   # サンプル数が少なすぎるものは除外
             continue
+
         pnls      = [t[0] for t in trades]
         hold_days = [t[1] for t in trades]
         total     = round(sum(pnls), 2)
         wr        = round(sum(1 for x in pnls if x > 0) / len(pnls) * 100, 1)
         avg_hold  = round(sum(hold_days) / len(hold_days), 1)
-        results.append({"tp": tp, "sl": sl, "pnl": total, "wr": wr,
-                        "count": len(trades), "avg_hold": avg_hold})
+        results.append({
+            "tp": tp, "sl": sl, "entry_cond": cond_name,
+            "pnl": total, "wr": wr, "count": len(trades), "avg_hold": avg_hold,
+        })
 
     if not results:
         return None
 
     results.sort(key=lambda x: x["pnl"], reverse=True)
     best = results[0]
+    print(f"  最適: {best['entry_cond']} TP{best['tp']}% SL{best['sl']}% "
+          f"勝率{best['wr']}% ${best['pnl']} {best['count']}回 avg{best['avg_hold']}日")
+
+    # 勝率80%以上のパターン数をログ出力
+    qualified_count = sum(1 for r in results if r["wr"] >= 80.0)
+    print(f"  勝率80%以上: {qualified_count}パターン / {len(results)}パターン中")
+
     return {
-        "best_tp": best["tp"], "best_sl": best["sl"],
-        "best_pnl": best["pnl"], "best_wr": best["wr"],
-        "best_count": best["count"], "best_avg_hold": best["avg_hold"],
-        "top10": results[:10],
+        "best": best,                  # 全体最良（勝率条件なし）
+        "all_results": results,        # 全パターン（format側でフィルタリング）
+        # write_backtest_result用に best の値をフラットにも持つ
+        "best_tp":       best["tp"],
+        "best_sl":       best["sl"],
+        "best_entry":    best["entry_cond"],
+        "best_pnl":      best["pnl"],
+        "best_wr":       best["wr"],
+        "best_count":    best["count"],
+        "best_avg_hold": best["avg_hold"],
     }
 
 
@@ -494,16 +565,20 @@ def write_backtest_result(long_sym: str, short_sym: str, result: dict):
         try:
             ws = sh.worksheet(BACKTEST_SHEET)
         except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=BACKTEST_SHEET, rows=500, cols=10)
-            ws.append_row(["実行日時", "LONG", "SHORT",
-                           "最適利確%", "最適損切%", "過去勝率%", "総損益($)", "取引回数", "平均保有日数"])
+            ws = sh.add_worksheet(title=BACKTEST_SHEET, rows=500, cols=11)
+            ws.append_row([
+                "実行日時", "LONG", "SHORT",
+                "最適エントリー条件", "最適利確%", "最適損切%",
+                "過去勝率%", "総損益($)", "取引回数", "平均保有日数",
+            ])
 
         ws.append_row([
             dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
             long_sym, short_sym,
+            result.get("best_entry", ""),
             result["best_tp"], result["best_sl"],
-            result["best_wr"], result["best_pnl"], result["best_count"],
-            result.get("best_avg_hold", ""),
+            result["best_wr"], result["best_pnl"],
+            result["best_count"], result.get("best_avg_hold", ""),
         ])
         print(f"  スプレッドシート書き込み完了: {long_sym}/{short_sym}")
     except Exception as e:
@@ -514,20 +589,31 @@ def write_backtest_result(long_sym: str, short_sym: str, result: dict):
 # ⑦ バックテスト結果のTelegram表示テキスト生成
 # ==============================================================
 def format_backtest_message(long_sym: str, short_sym: str, result: dict) -> str:
-    top10_lines = ""
-    for rank, r in enumerate(result["top10"], 1):
-        avg_h = r.get("avg_hold", "?")
-        top10_lines += (
-            f"  {rank:2}位 TP{r['tp']}% SL{r['sl']}%"
-            f" 勝率{r['wr']}% ${r['pnl']} {r['count']}回 avg{avg_h}日\n"
-        )
+    """
+    勝率80%以上のパターンを総損益順に上位5つ表示。
+    条件名は表示しない（どの条件でもエントリー推奨として扱う）。
+    """
+    qualified = [r for r in result["all_results"] if r["wr"] >= 80.0]
+    qualified_sorted = sorted(qualified, key=lambda x: x["pnl"], reverse=True)[:5]
+
+    if qualified_sorted:
+        lines = ""
+        for rank, r in enumerate(qualified_sorted, 1):
+            lines += (
+                f"  {rank}. TP{r['tp']}% SL{r['sl']}%"
+                f" 勝率{r['wr']}% ${r['pnl']} {r['count']}回 avg{r['avg_hold']}日\n"
+            )
+        recommend_block = f"  ✅ 推奨パターン（勝率80%以上・上位5つ）\n{lines}"
+    else:
+        recommend_block = "  ⚠️ 勝率80%以上のパターンなし\n"
+
+    # 全体の最良結果（勝率条件なし）
+    best = result["best"]
     return (
         f"\n📊 {long_sym}L/{short_sym}S（過去{BACKTEST_DAYS}日）\n"
-        f"  🏆 最適: 利確{result['best_tp']}% / 損切{result['best_sl']}%\n"
-        f"  勝率:{result['best_wr']}% 総損益:${result['best_pnl']}"
-        f" {result['best_count']}回 平均保有:{result.get('best_avg_hold','?')}日\n"
-        f"  ─ Top10 ─\n"
-        f"{top10_lines}"
+        f"  🏆 全体最適: TP{best['tp']}% / SL{best['sl']}%"
+        f" 勝率{best['wr']}% ${best['pnl']} {best['count']}回 avg{best['avg_hold']}日\n"
+        f"{recommend_block}"
     )
 
 
