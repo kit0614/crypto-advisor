@@ -333,7 +333,8 @@ def fetch_hyperliquid() -> Dict[str, float]:
 # Bitget
 # ─────────────────────────────────────────
 def fetch_bitget() -> Dict[str, float]:
-    """fundingRate decimal → 1h%"""
+    """fundingRate は8時間分のdecimal → 1h% = decimal * 100 / 8"""
+    INTERVAL_H = 8
     try:
         js = get("https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES")
         result = {}
@@ -341,7 +342,7 @@ def fetch_bitget() -> Dict[str, float]:
             sym = normalize_symbol(item.get("symbol"))
             fr  = to_float(item.get("fundingRate"))
             if sym and fr is not None:
-                result[sym] = fr * 100.0
+                result[sym] = fr * 100.0 / INTERVAL_H
         log.info(f"Bitget: {len(result)} pairs")
         return result
     except Exception as e:
