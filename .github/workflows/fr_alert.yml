@@ -1,0 +1,32 @@
+name: FR差アービトラージ通知（毎時45分）
+
+on:
+  schedule:
+    # 毎時45分に実行（UTC36分 = JST45分）
+    - cron: '36 * * * *'
+  workflow_dispatch:  # 手動実行ボタン付き
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: リポジトリをチェックアウト
+        uses: actions/checkout@v4
+
+      - name: Python セットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 依存パッケージをインストール
+        run: pip install requests
+
+      - name: FR取得 & Telegram通知
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TOP_N:      "5"
+          MIN_SPREAD: "0.005"
+        run: python notify_telegram.py
