@@ -333,17 +333,35 @@ def fetch_hyperliquid() -> Dict[str, float]:
 # Bitget
 # ─────────────────────────────────────────
 def fetch_bitget() -> Dict[str, float]:
-    """fundingRate は8時間分のdecimal → 1h% = decimal * 100 / 8"""
-    INTERVAL_H = 8
+    """
+    fundingRate は各銘柄の fundInterval 時間分のdecimal
+    1h% = fundingRate * 100 / fundInterval
+    fundInterval は contracts エンドポイントで銘柄ごとに取得（1/4/8時間など）
+    """
+    DEFAULT_INTERVAL = 8
     try:
-        js = get("https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES")
+        # 1) 銘柄ごとの fundInterval を一括取得
+        contracts_js = get("https://api.bitget.com/api/v2/mix/market/contracts?productType=USDT-FUTURES")
+        interval_map: Dict[str, float] = {}
+        for c in (contracts_js.get("data") or []):
+            sym = c.get("symbol")
+            fi  = to_float(c.get("fundInterval"))
+            if sym and fi and fi > 0:
+                interval_map[sym] = fi
+
+        # 2) 現在のFRを取得
+        tickers_js = get("https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES")
         result = {}
-        for item in (js.get("data") or []):
-            sym = normalize_symbol(item.get("symbol"))
+        for item in (tickers_js.get("data") or []):
+            raw_sym = item.get("symbol")
+            sym = normalize_symbol(raw_sym)
             fr  = to_float(item.get("fundingRate"))
-            if sym and fr is not None:
-                result[sym] = fr * 100.0 / INTERVAL_H
-        log.info(f"Bitget: {len(result)} pairs")
+            if not sym or fr is None:
+                continue
+            interval = interval_map.get(raw_sym, DEFAULT_INTERVAL)
+            result[sym] = fr * 100.0 / interval
+
+        log.info(f"Bitget: {len(result)} pairs (interval_map={len(interval_map)})")
         return result
     except Exception as e:
         log.warning(f"Bitget error: {e}")
