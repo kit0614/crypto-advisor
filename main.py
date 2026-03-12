@@ -1,119 +1,187 @@
-"""
-相関両建てアドバイザー 統合版
-=============================
-【処理フロー】
-1. スプレッドシートからオープンポジションを読み込み
-2. CoinGeckoで現在価格を取得
-3. Claude APIでポジション判断 + 新規推奨ペア(2〜3個)を取得
-4. 推奨ペアごとにバックテストを自動実行（過去180日・グリッドサーチ）
-5. Telegramに以下をまとめて通知
-   - 既存ポジション判断
-   - 新規推奨ペア + バックテスト結果（Top10含む）
-   - 全体相場観
-
-【注意】
-- CoinGecko無料APIのレート制限対策として、バックテスト間に待機時間を入れています
-- バックテストは日次データのため、4時間足との誤差があります（傾向把握として活用）
-- スプレッドシートのP列(index=15)にエントリーレシオを記録してください
-"""
-
 import os
 import re
 import json
+import math
 import time
-import itertools
 import requests
 import datetime as dt
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ========== 環境変数 ==========
-SPREADSHEET_ID    = os.environ["SPREADSHEET_ID"]
-SHEET_NAME        = os.environ.get("SHEET_NAME", "猫山")
+# =========================
+# 環境変数
+# =========================
+SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
+SHEET_NAME = os.environ.get("SHEET_NAME", "猫山")
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 GOOGLE_CREDS_JSON = os.environ["GOOGLE_CREDS_JSON"]
 
-COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+BYBIT_BASE = "https://api.bybit.com"
 
-# ========== 銘柄マッピング ==========
-SYMBOL_TO_CG_ID = {
-    "BTC": "bitcoin",       "ETH": "ethereum",      "SOL": "solana",
-    "BNB": "binancecoin",   "ARB": "arbitrum",       "OP": "optimism",
-    "DOT": "polkadot",      "ADA": "cardano",        "LINK": "chainlink",
-    "AVAX": "avalanche-2",  "ATOM": "cosmos",        "VET": "vechain",
-    "APT": "aptos",         "SEI": "sei-network",    "IMX": "immutable-x",
-    "GRT": "the-graph",     "FIL": "filecoin",       "AAVE": "aave",
-    "UNI": "uniswap",       "XLM": "stellar",        "ETC": "ethereum-classic",
-    "DOGE": "dogecoin",     "XRP": "ripple",         "SUI": "sui",
-    "TRX": "tron",          "BCH": "bitcoin-cash",   "ALGO": "algorand",
-    "ONDO": "ondo-finance",  "WLD": "worldcoin-wld",
-}
-
-LONG_CANDIDATES  = ["BTC", "ETH", "SOL", "BNB"]
+LONG_CANDIDATES = ["BTC", "ETH", "SOL", "BNB"]
 SHORT_CANDIDATES = [
-    "ARB", "OP", "DOT", "ADA", "LINK", "AVAX",
-    "ATOM", "VET", "APT", "SEI", "IMX", "GRT",
-    "FIL", "AAVE", "UNI", "XLM", "ETC", "DOGE",
+    "ARB", "OP", "DOT", "ADA", "LINK", "AVAX", "ATOM", "VET", "APT", "SEI",
+    "IMX", "GRT", "FIL", "AAVE", "UNI", "XLM", "ETC", "DOGE", "ALGO", "ONDO",
+    "WLD", "INJ", "LDO", "CRV", "DYDX", "PENDLE", "RUNE", "ENA", "AERO"
 ]
-ZOMBIE_SYMBOLS = ["LTC", "BCH", "ETC", "XLM", "DOGE", "ALGO", "TRX", "XRP"]
+UNIVERSE = sorted(set(LONG_CANDIDATES + SHORT_CANDIDATES))
 
-# ========== ルール定数 ==========
-RATIO_TAKE_PROFIT_PCT = 0.08   # レシオ-8%で利確シグナル
-RATIO_STOP_LOSS_PCT   = 0.15   # レシオ+15%で損切りシグナル
-RATIO_NANPIN_PCT      = 0.07   # レシオ+7%でナンピン検討
-DOLLAR_STOP_LOSS      = -200.0 # -$200で問答無用撤退
-DOLLAR_TAKE_PROFIT    = 30.0   # +$30で利確検討
-HOLD_HOURS_LONG       = 168    # 7日超で利確積極検討
+# NOTE型パラメータ
+BARS_PER_DAY_4H = 6
+WINDOW_14D = 14 * BARS_PER_DAY_4H
+WINDOW_30D = 30 * BARS_PER_DAY_4H
+WINDOW_90D = 90 * BARS_PER_DAY_4H
+WINDOW_180D = 180 * BARS_PER_DAY_4H
+WINDOW_12M = 365 * BARS_PER_DAY_4H
+ATR_N = 14
+SPIKE_K = 6.0
+SPIKE_FLOOR = 0.02
+HARD_SL_DOLLAR = -30.0
+TP_HALF_DOLLAR = 8.0
+TP_FULL_DOLLAR = 15.0
+MA90_MULT_CUT = 1.05
 
-# ========== バックテスト設定 ==========
-BACKTEST_DAYS  = 180
-POSITION_SIZE  = 500  # 片側ポジション額($)
-TP_RANGE = [round(x, 1) for x in np.arange(0.5, 6.0, 0.5)]   # 0.5〜5.5%
-SL_RANGE = [round(x, 1) for x in np.arange(2.0, 21.0, 1.0)]  # 2〜20%
-BACKTEST_SHEET = "backtest_results"
+# バックテスト
+BT_TP_VALUES = [0.8, 1.2, 1.5, 2.0, 2.5, 3.0]
+BT_SL_VALUES = [1.5, 2.0, 2.5, 3.0, 4.0, 5.0]
+BT_MAX_HOLD_BARS = 18  # 3日
+
+# ================
+# Util
+# ================
+
+def utc_now_str() -> str:
+    return dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
 
-# ==============================================================
-# ① 現在価格取得
-# ==============================================================
-def get_prices(symbols: list) -> dict:
-    ids, sym_to_id = [], {}
-    for sym in symbols:
-        cg_id = SYMBOL_TO_CG_ID.get(sym.upper())
-        if cg_id:
-            ids.append(cg_id)
-            sym_to_id[cg_id] = sym.upper()
-    if not ids:
-        return {}
+def safe_float(x: str) -> Optional[float]:
     try:
-        r = requests.get(
-            f"{COINGECKO_BASE}/simple/price",
-            params={"ids": ",".join(ids), "vs_currencies": "usd"},
-            timeout=30,
-            headers={"Accept": "application/json"},
-        )
+        return float(str(x).replace(",", "").strip())
+    except Exception:
+        return None
+
+
+def calc_hold_hours(entry_time_str: str) -> Optional[float]:
+    for fmt in ["%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d", "%Y-%m-%d"]:
+        try:
+            delta = dt.datetime.utcnow() - dt.datetime.strptime(entry_time_str, fmt)
+            return delta.total_seconds() / 3600
+        except ValueError:
+            pass
+    return None
+
+
+def sma(arr: np.ndarray, n: int) -> np.ndarray:
+    if len(arr) < n:
+        return np.full(len(arr), np.nan)
+    out = np.full(len(arr), np.nan)
+    csum = np.cumsum(np.insert(arr, 0, 0.0))
+    out[n - 1:] = (csum[n:] - csum[:-n]) / n
+    return out
+
+
+def slope_log(series: np.ndarray, window: int) -> float:
+    if len(series) < max(window, 10):
+        return np.nan
+    y = np.log(series[-window:])
+    x = np.arange(len(y))
+    try:
+        return float(np.polyfit(x, y, 1)[0])
+    except Exception:
+        return np.nan
+
+
+def max_runup_from_low(series: np.ndarray) -> float:
+    if len(series) < 2:
+        return np.nan
+    min_so_far = series[0]
+    best = 0.0
+    for v in series[1:]:
+        if min_so_far > 0:
+            best = max(best, (v - min_so_far) / min_so_far)
+        min_so_far = min(min_so_far, v)
+    return float(best)
+
+
+# ================
+# Bybit 4h データ取得
+# ================
+
+def bybit_symbol(sym: str) -> str:
+    return f"{sym.upper()}USDT"
+
+
+def fetch_bybit_klines(symbol: str, interval: str = "240", total_limit: int = 2200) -> List[dict]:
+    pair = bybit_symbol(symbol)
+    rows: List[dict] = []
+    end_ms = None
+    remaining = total_limit
+
+    while remaining > 0:
+        limit = min(remaining, 1000)
+        params = {
+            "category": "linear",
+            "symbol": pair,
+            "interval": interval,
+            "limit": limit,
+        }
+        if end_ms is not None:
+            params["end"] = end_ms
+        r = requests.get(f"{BYBIT_BASE}/v5/market/kline", params=params, timeout=30)
+        r.raise_for_status()
         data = r.json()
-        prices = {}
-        for cg_id, val in data.items():
-            sym = sym_to_id.get(cg_id)
-            if sym and "usd" in val:
-                prices[sym] = float(val["usd"])
-        print(f"価格取得成功: {len(prices)}銘柄")
-        return prices
-    except Exception as e:
-        print(f"価格取得失敗: {e}")
-        return {}
+        if data.get("retCode") != 0:
+            raise RuntimeError(f"Bybit kline error {pair}: {data}")
+        part = data["result"]["list"]
+        if not part:
+            break
+        # Bybitは新しい順
+        for item in part:
+            rows.append({
+                "ts": int(item[0]),
+                "open": float(item[1]),
+                "high": float(item[2]),
+                "low": float(item[3]),
+                "close": float(item[4]),
+                "volume": float(item[5]),
+            })
+        remaining -= len(part)
+        oldest = min(int(x[0]) for x in part)
+        end_ms = oldest - 1
+        if len(part) < limit:
+            break
+        time.sleep(0.08)
+
+    # 時系列昇順・重複排除
+    dedup = {}
+    for r in rows:
+        dedup[r["ts"]] = r
+    out = [dedup[k] for k in sorted(dedup.keys())]
+    return out
 
 
-# ==============================================================
-# ② スプレッドシート読み込み
-# ==============================================================
-def get_open_positions() -> list:
+def fetch_latest_closes(symbols: List[str]) -> Dict[str, float]:
+    prices = {}
+    for sym in symbols:
+        try:
+            rows = fetch_bybit_klines(sym, total_limit=5)
+            if rows:
+                prices[sym] = float(rows[-1]["close"])
+        except Exception as e:
+            print(f"latest close failed {sym}: {e}")
+    return prices
+
+
+# ================
+# Sheet 読み込み
+# ================
+
+def get_open_positions() -> List[dict]:
     creds_dict = json.loads(GOOGLE_CREDS_JSON)
     creds = Credentials.from_service_account_info(
         creds_dict,
@@ -123,196 +191,266 @@ def get_open_positions() -> list:
     ws = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
     rows = ws.get_all_values()
 
-    open_positions = []
+    positions = []
     for i, row in enumerate(rows[2:], start=3):
         if len(row) < 11:
             continue
-        exchange        = row[0].strip()
-        entry_time      = row[1].strip()
-        long_sym        = row[3].strip()
-        long_qty        = row[4].strip()
-        long_entry      = row[5].strip()
-        short_sym       = row[8].strip()
-        short_qty       = row[9].strip()
-        short_entry     = row[10].strip()
-        strategy        = row[14].strip() if len(row) > 14 else ""
-        entry_ratio_raw = row[15].strip() if len(row) > 15 else ""
-        short_pnl_cell  = row[12].strip() if len(row) > 12 else ""
+        exchange = row[0].strip()
+        entry_time = row[1].strip()
+        long_sym = row[3].strip().upper()
+        long_qty = safe_float(row[4])
+        long_entry = safe_float(row[5])
+        short_sym = row[8].strip().upper()
+        short_qty = safe_float(row[9])
+        short_entry = safe_float(row[10])
+        short_pnl_cell = row[12].strip() if len(row) > 12 else ""
+        strategy = row[14].strip() if len(row) > 14 else ""
+        entry_ratio = safe_float(row[15]) if len(row) > 15 and row[15].strip() else None
 
-        if not (exchange and long_sym and not short_pnl_cell):
+        if not (exchange and long_sym and short_sym and not short_pnl_cell):
             continue
-        try:
-            long_entry_f  = float(long_entry.replace(",", ""))  if long_entry  else 0
-            short_entry_f = float(short_entry.replace(",", "")) if short_entry else 0
-
-            if entry_ratio_raw:
-                entry_ratio = float(entry_ratio_raw.replace(",", ""))
-            elif long_entry_f > 0 and short_entry_f > 0:
-                entry_ratio = short_entry_f / long_entry_f
-            else:
-                entry_ratio = None
-
-            open_positions.append({
-                "row": i, "exchange": exchange, "entry_time": entry_time,
-                "long_sym": long_sym,
-                "long_qty":    float(long_qty.replace(",", ""))  if long_qty   else 0,
-                "long_entry":  long_entry_f,
-                "short_sym":   short_sym,
-                "short_qty":   float(short_qty.replace(",", "")) if short_qty  else 0,
-                "short_entry": short_entry_f,
-                "strategy": strategy, "entry_ratio": entry_ratio,
-            })
-        except Exception as e:
-            print(f"行{i}パース失敗: {e}")
-    return open_positions
-
-
-# ==============================================================
-# ③ 含み損益 + レシオ計算
-# ==============================================================
-def calc_hold_hours(entry_time_str: str) -> Optional[float]:
-    for fmt in ["%Y/%m/%d %H:%M", "%Y-%m-%d %H:%M",
-                "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d", "%Y-%m-%d"]:
-        try:
-            delta = dt.datetime.utcnow() - dt.datetime.strptime(entry_time_str, fmt)
-            return delta.total_seconds() / 3600
-        except ValueError:
+        if None in (long_qty, long_entry, short_qty, short_entry):
             continue
-    return None
+        if entry_ratio is None and long_entry > 0 and short_entry > 0:
+            entry_ratio = short_entry / long_entry
+
+        positions.append({
+            "row": i,
+            "exchange": exchange,
+            "entry_time": entry_time,
+            "long_sym": long_sym,
+            "long_qty": long_qty,
+            "long_entry": long_entry,
+            "short_sym": short_sym,
+            "short_qty": short_qty,
+            "short_entry": short_entry,
+            "strategy": strategy,
+            "entry_ratio": entry_ratio,
+        })
+    return positions
 
 
-def calc_pnl(position: dict, prices: dict) -> dict:
-    long_price  = prices.get(position["long_sym"])
-    short_price = prices.get(position["short_sym"])
+# ================
+# NOTE 指標
+# ================
 
-    long_pnl  = (long_price  - position["long_entry"])  * position["long_qty"] \
-        if long_price  and position["long_entry"]  > 0 else None
-    short_pnl = (position["short_entry"] - short_price) * position["short_qty"] \
-        if short_price and position["short_entry"] > 0 else None
-    total_pnl = (long_pnl + short_pnl) \
-        if (long_pnl is not None and short_pnl is not None) else None
+def align_ratio_series(strong_rows: List[dict], weak_rows: List[dict]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    s = {r["ts"]: r["close"] for r in strong_rows}
+    w = {r["ts"]: r["close"] for r in weak_rows}
+    ts = sorted(set(s.keys()) & set(w.keys()))
+    strong = np.array([s[t] for t in ts], dtype=float)
+    weak = np.array([w[t] for t in ts], dtype=float)
+    ratio = weak / strong
+    return np.array(ts, dtype=np.int64), strong, ratio
 
-    current_ratio = (short_price / long_price) \
-        if (long_price and short_price and long_price > 0) else None
-    entry_ratio   = position.get("entry_ratio")
-    ratio_change_pct = ((current_ratio - entry_ratio) / entry_ratio * 100) \
-        if (current_ratio and entry_ratio and entry_ratio > 0) else None
-    hold_hours = calc_hold_hours(position.get("entry_time", ""))
 
-    # シグナル判定
-    if total_pnl is not None and total_pnl <= DOLLAR_STOP_LOSS:
-        signal = "🔴損切り【撤退ライン到達】"
-    elif ratio_change_pct is not None and ratio_change_pct >= RATIO_STOP_LOSS_PCT * 100:
-        signal = f"🔴損切り検討【レシオ+{ratio_change_pct:.1f}%】"
-    elif (ratio_change_pct is not None and ratio_change_pct <= -RATIO_TAKE_PROFIT_PCT * 100) \
-            or (total_pnl is not None and total_pnl >= DOLLAR_TAKE_PROFIT):
-        pnl_str = f"${total_pnl:.2f}" if total_pnl is not None else ""
-        ratio_str = f"レシオ{ratio_change_pct:.1f}% / " if ratio_change_pct is not None else ""
-        signal = f"🟢利確検討【{ratio_str}{pnl_str}】"
-    elif ratio_change_pct is not None \
-            and RATIO_NANPIN_PCT * 100 <= ratio_change_pct < RATIO_STOP_LOSS_PCT * 100:
-        signal = f"🟡ナンピン検討【レシオ+{ratio_change_pct:.1f}%】"
-    elif hold_hours is not None and hold_hours >= HOLD_HOURS_LONG \
-            and total_pnl is not None and total_pnl > 0:
-        signal = f"🟢利確検討【{hold_hours:.0f}時間保有】"
-    else:
-        signal = "🔵維持"
+def calc_corr180(strong: np.ndarray, weak: np.ndarray) -> float:
+    if len(strong) < WINDOW_180D + 2:
+        return np.nan
+    rs = np.diff(np.log(strong[-(WINDOW_180D + 1):]))
+    rw = np.diff(np.log(weak[-(WINDOW_180D + 1):]))
+    if np.std(rs) == 0 or np.std(rw) == 0:
+        return np.nan
+    return float(np.corrcoef(rs, rw)[0, 1])
+
+
+def calc_ratio_metrics(ts: np.ndarray, strong: np.ndarray, ratio: np.ndarray) -> dict:
+    ratio_ret_4h = float(ratio[-1] / ratio[-2] - 1) if len(ratio) >= 2 else np.nan
+    ratio_ret_1d = float(ratio[-1] / ratio[-7] - 1) if len(ratio) >= 7 else np.nan
+
+    tr = np.abs(np.diff(ratio, prepend=ratio[0]))
+    atr = sma(tr, ATR_N)
+    atr_last = float(atr[-1]) if not math.isnan(atr[-1]) else np.nan
+    atr_pct = float(atr_last / ratio[-1]) if ratio[-1] > 0 and not math.isnan(atr_last) else np.nan
+    spike_threshold = max(SPIKE_FLOOR, SPIKE_K * atr_pct) if not math.isnan(atr_pct) else np.nan
+    spike_flags = (ratio[1:] / ratio[:-1] - 1) > np.maximum(SPIKE_FLOOR, SPIKE_K * (atr[1:] / ratio[1:]))
+    spike_count = int(np.nansum(spike_flags)) if len(spike_flags) else 0
+
+    ma90 = float(np.nanmean(ratio[-WINDOW_90D:])) if len(ratio) >= WINDOW_90D else float(np.nanmean(ratio))
+    ma90_mult = float(ratio[-1] / ma90) if ma90 > 0 else np.nan
 
     return {
-        **position,
-        "long_current": long_price,   "short_current": short_price,
-        "long_pnl":     long_pnl,     "short_pnl":     short_pnl,
-        "total_pnl":    total_pnl,    "current_ratio": current_ratio,
-        "entry_ratio":  entry_ratio,  "ratio_change_pct": ratio_change_pct,
-        "hold_hours":   hold_hours,   "signal":        signal,
+        "ratio_ret_4h": ratio_ret_4h,
+        "ratio_ret_1d": ratio_ret_1d,
+        "atr_pct_ratio_14": atr_pct,
+        "spike_threshold_4h": spike_threshold,
+        "spike_count_12m": spike_count,
+        "max_runup_12m": max_runup_from_low(ratio[-min(len(ratio), WINDOW_12M):]),
+        "ma90_ratio": ma90,
+        "ma90_mult": ma90_mult,
+        "slope_14d": slope_log(ratio, min(WINDOW_14D, len(ratio))),
+        "slope_90d": slope_log(ratio, min(WINDOW_90D, len(ratio))),
+        "slope_180d": slope_log(ratio, min(WINDOW_180D, len(ratio))),
+        "slope_12m": slope_log(ratio, min(WINDOW_12M, len(ratio))),
     }
 
 
-# ==============================================================
-# ④ Claude API（ポジション判断 + 推奨ペア抽出）
-# ==============================================================
-def analyze_with_claude(positions_with_pnl: list, prices: dict) -> tuple:
-    """戻り値: (表示用テキスト, 推奨ペアリスト[{"long":str,"short":str}])"""
+def spike_grade(spike_count: int, max_runup: float) -> str:
+    if spike_count >= 4 or max_runup > 0.65:
+        return "AVOID"
+    if spike_count >= 2 or max_runup > 0.45:
+        return "WATCH"
+    return "OK"
 
-    pos_text = ""
-    for p in positions_with_pnl:
-        total_str  = f"${p['total_pnl']:.2f}"    if p["total_pnl"]    is not None else "計算不可"
-        long_cur   = f"${p['long_current']:.4f}"  if p["long_current"] else "取得不可"
-        short_cur  = f"${p['short_current']:.6f}" if p["short_current"] else "取得不可"
-        hold_str   = f"{p['hold_hours']:.0f}時間" if p["hold_hours"]   is not None else "不明"
 
-        if p["current_ratio"] is not None and p["entry_ratio"] is not None:
-            direction  = "有利✅" if (p["ratio_change_pct"] or 0) < 0 else "不利⚠️"
-            ratio_info = (f"エントリー:{p['entry_ratio']:.6f}→現在:{p['current_ratio']:.6f} "
-                          f"変化:{p['ratio_change_pct']:+.1f}%({direction})")
-        elif p["current_ratio"] is not None:
-            ratio_info = f"現在レシオ:{p['current_ratio']:.6f}（エントリー時未記録）"
-        else:
-            ratio_info = "計算不可"
+def strong_health(strong_sym: str, data_map: Dict[str, List[dict]]) -> str:
+    strong_rows = data_map.get(strong_sym)
+    if not strong_rows or len(strong_rows) < 8:
+        return "CAUTION"
+    s = np.array([r["close"] for r in strong_rows], dtype=float)
+    rets_4h = []
+    rets_1d = []
+    for sym, rows in data_map.items():
+        if sym == strong_sym or sym in LONG_CANDIDATES:
+            continue
+        if len(rows) < 8:
+            continue
+        px = np.array([r["close"] for r in rows], dtype=float)
+        # 最後のバー数を合わせる
+        m = min(len(px), len(s))
+        px = px[-m:]
+        ss = s[-m:]
+        rets_4h.append(px[-1] / px[-2] - 1)
+        rets_1d.append(px[-1] / px[-7] - 1)
+    if not rets_4h:
+        return "CAUTION"
+    alt_4h = float(np.mean(rets_4h))
+    alt_1d = float(np.mean(rets_1d))
+    sr_4h = float(s[-1] / s[-2] - 1) - alt_4h
+    sr_1d = float(s[-1] / s[-7] - 1) - alt_1d
+    if sr_4h >= 0 and sr_1d >= 0:
+        return "OK"
+    if sr_4h < 0 and sr_1d < 0:
+        return "OFF"
+    return "CAUTION"
 
-        pos_text += (
-            f"\n【{p['exchange']}】{p['long_sym']}L/{p['short_sym']}S ({p['strategy']})\n"
-            f"  エントリー:{p['entry_time']}（保有:{hold_str}）\n"
-            f"  LONG:${p['long_entry']:.4f}→{long_cur}\n"
-            f"  SHORT:${p['short_entry']:.6f}→{short_cur}\n"
-            f"  合計損益:{total_str} / レシオ:{ratio_info}\n"
-            f"  判定:{p['signal']}\n"
+
+# ================
+# 判定
+# ================
+
+def decide_new_action(metrics: dict, corr180: float, s_health: str) -> Tuple[str, str]:
+    trend_ok = all((not math.isnan(metrics[k]) and metrics[k] < 0) for k in ("slope_12m", "slope_180d", "slope_90d"))
+    spike_g = spike_grade(metrics["spike_count_12m"], metrics["max_runup_12m"])
+    if math.isnan(corr180) or corr180 < 0.70 or not trend_ok or spike_g == "AVOID":
+        return "SKIP", spike_g
+    if s_health == "OFF":
+        return "SKIP", spike_g
+    if metrics["ratio_ret_1d"] < 0 and metrics["ratio_ret_4h"] < 0:
+        return "ENTER", spike_g
+    if metrics["ratio_ret_1d"] < 0 and metrics["ratio_ret_4h"] >= 0:
+        return "WAIT", spike_g
+    return "SKIP", spike_g
+
+
+def decide_hold_action(pos: dict, pnl_total: Optional[float], metrics: dict, s_health: str) -> Tuple[str, bool, str]:
+    dca_ok = False
+    if not math.isnan(metrics["ratio_ret_4h"]) and not math.isnan(metrics["atr_pct_ratio_14"]):
+        dca_ok = (
+            metrics["ratio_ret_4h"] > max(SPIKE_FLOOR, SPIKE_K * metrics["atr_pct_ratio_14"]) and
+            metrics["ma90_mult"] <= MA90_MULT_CUT and
+            (not math.isnan(metrics["slope_14d"]) and metrics["slope_14d"] <= 0)
         )
+    if pnl_total is not None and pnl_total <= HARD_SL_DOLLAR:
+        return "EXIT", dca_ok, "HARD_SL"
+    if metrics["ma90_mult"] > MA90_MULT_CUT:
+        return "EXIT", dca_ok, "SHAPE_SL"
+    if pnl_total is not None and pnl_total >= TP_FULL_DOLLAR:
+        return "TRIM", dca_ok, "TP_FULL"
+    if pnl_total is not None and pnl_total >= TP_HALF_DOLLAR:
+        return "TRIM", dca_ok, "TP_HALF"
+    if metrics["ratio_ret_1d"] > 0 and s_health == "OFF":
+        return "TRIM", dca_ok, "STRONG_OFF"
+    return "HOLD", dca_ok, "OK"
 
-    price_text  = "\n".join([f"  {s}: ${v}" for s, v in sorted(prices.items())])
-    zombie_list = ", ".join(ZOMBIE_SYMBOLS)
 
-    prompt = f"""あなたは仮想通貨の相関両建てトレードの専門アドバイザーです。
+# ================
+# PnL
+# ================
 
-【戦術ルール（数値ベース・厳守）】
-■ポジション基本
-- 強い銘柄(BTC/ETH/SOL/BNB)をロング、弱いアルトをショート
-- ロング：ショート=1:1、レバレッジ最大5倍
+def calc_position_pnl(position: dict, latest_prices: Dict[str, float]) -> dict:
+    lp = latest_prices.get(position["long_sym"])
+    sp = latest_prices.get(position["short_sym"])
+    long_pnl = (lp - position["long_entry"]) * position["long_qty"] if lp else None
+    short_pnl = (position["short_entry"] - sp) * position["short_qty"] if sp else None
+    total_pnl = (long_pnl + short_pnl) if long_pnl is not None and short_pnl is not None else None
+    current_ratio = (sp / lp) if lp and sp else None
+    entry_ratio = position.get("entry_ratio")
+    ratio_change_pct = ((current_ratio - entry_ratio) / entry_ratio * 100) if current_ratio and entry_ratio else None
+    hold_hours = calc_hold_hours(position.get("entry_time", ""))
+    return {
+        **position,
+        "long_current": lp,
+        "short_current": sp,
+        "long_pnl": long_pnl,
+        "short_pnl": short_pnl,
+        "total_pnl": total_pnl,
+        "current_ratio": current_ratio,
+        "ratio_change_pct": ratio_change_pct,
+        "hold_hours": hold_hours,
+    }
 
-■損切り（最優先）
-- 合計損失-$200到達→即損切り
-- レシオ変化+15%以上→損切り検討
 
-■利確
-- 含み益+$30以上 or レシオ変化-8%以下→利確
-- 7日超保有かつ含み益あり→積極利確
+# ================
+# Backtest (4h)
+# ================
 
-■ナンピン
-- レシオ変化+7%〜+15%→ナンピン検討（最大3回）
+def backtest_ratio_grid(ratio: np.ndarray) -> dict:
+    # 4h進捗ベースの軽量グリッド
+    best = None
+    rows = []
+    if len(ratio) < 200:
+        return {"best": None, "top": []}
+    for tp in BT_TP_VALUES:
+        for sl in BT_SL_VALUES:
+            pnl = 0.0
+            wins = 0
+            count = 0
+            holds = []
+            i = 7
+            while i < len(ratio) - BT_MAX_HOLD_BARS - 1:
+                if ratio[i] / ratio[i - 6] - 1 < 0 and ratio[i] / ratio[i - 1] - 1 < 0:
+                    entry = ratio[i]
+                    tp_lv = entry * (1 - tp / 100)
+                    sl_lv = entry * (1 + sl / 100)
+                    exit_ratio = ratio[min(i + BT_MAX_HOLD_BARS, len(ratio) - 1)]
+                    hold = BT_MAX_HOLD_BARS
+                    for j in range(i + 1, min(i + BT_MAX_HOLD_BARS + 1, len(ratio))):
+                        if ratio[j] <= tp_lv or ratio[j] >= sl_lv:
+                            exit_ratio = ratio[j]
+                            hold = j - i
+                            break
+                    trade_pnl = -(exit_ratio - entry) / entry * 500.0
+                    pnl += trade_pnl
+                    wins += 1 if trade_pnl > 0 else 0
+                    count += 1
+                    holds.append(hold)
+                    i += hold + 1
+                else:
+                    i += 1
+            if count < 5:
+                continue
+            row = {
+                "tp": tp,
+                "sl": sl,
+                "pnl": round(pnl, 2),
+                "wr": round(wins / count * 100, 1),
+                "count": count,
+                "avg_hold_bars": round(float(np.mean(holds)), 1) if holds else None,
+            }
+            rows.append(row)
+            if best is None or row["pnl"] > best["pnl"]:
+                best = row
+    rows = sorted(rows, key=lambda x: (x["pnl"], x["wr"]), reverse=True)[:10]
+    return {"best": best, "top": rows}
 
-■ゾンビ銘柄（新規ショート非推奨）: {zombie_list}
 
-【オープンポジション】
-{pos_text if pos_text else "なし"}
+# ================
+# Claude 整形専用
+# ================
 
-【現在価格】
-{price_text}
-
-【回答形式（厳守）】
-1. 各ポジション判断（利確/ナンピン/損切り/維持を明示、根拠1行）
-
-2. 新規エントリー推奨（★厳格フィルター★）
-   以下の条件を【すべて】満たすペアのみ推奨すること。
-   1つでも満たさなければ「現在エントリー推奨なし」と明記してRECOMMENDを出力しないこと。
-
-   【エントリー条件（全AND）】
-   A. 相場環境：BTC/ETH/SOL/BNBが全体的にアルトより強い局面である
-      → アルト全面高・BTC下落局面では推奨禁止
-   B. ショート候補が明確に弱い根拠がある
-      → 「なんとなく弱そう」は禁止。セクター・ファンダ・需給で具体的に説明できること
-   C. ゾンビ銘柄({zombie_list})をショートに使わない
-
-   条件を満たすペアがあれば以下の形式で出力（最大2個まで）：
-   RECOMMEND: LONG=BTC SHORT=DOT
-   ※推奨理由を1行で（具体的な根拠を必ず含めること）
-
-   条件を満たさない場合：
-   「⛔ 現在エントリー推奨なし：[理由を1行で]」と明記する
-
-3. 相場観（3行以内、エントリーの有無の判断根拠を含めること）
-
-日本語・スマホで読みやすく・絵文字適度に。"""
-
+def render_with_claude(payload: dict) -> str:
+    prompt = f"""あなたはTelegram通知文の整形担当です。判断はすでにPythonが確定しています。\n\nルール:\n- action_hold / action_new / dca_ok を絶対に変更しない\n- 数値を再計算しない\n- 既存ポジションは HOLD/TRIM/EXIT をそのまま表示\n- 新規候補は ENTER/WAIT/SKIP をそのまま表示\n- スマホで読みやすい日本語\n- 4000字以内\n\n入力JSON:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n出力形式:\n1. 実行時刻\n2. 保有中判定\n3. 新規候補\n4. 一言コメント\n"""
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -329,407 +467,136 @@ def analyze_with_claude(positions_with_pnl: list, prices: dict) -> tuple:
     )
     data = response.json()
     if "content" not in data:
-        raise RuntimeError(f"Claude APIエラー: {data.get('error', {}).get('message', str(data))}")
-
-    text = data["content"][0]["text"]
-
-    # RECOMMEND行から推奨ペアを抽出
-    pairs = []
-    for m in re.finditer(r"RECOMMEND:\s*LONG=(\w+)\s+SHORT=(\w+)", text):
-        long_sym, short_sym = m.group(1).upper(), m.group(2).upper()
-        if long_sym in SYMBOL_TO_CG_ID and short_sym in SYMBOL_TO_CG_ID:
-            pairs.append({"long": long_sym, "short": short_sym})
-
-    # 表示テキストからRECOMMEND行を除去（後でバックテスト結果と一緒に表示）
-    display_text = re.sub(r"RECOMMEND:.*\n?", "", text).strip()
-    return display_text, pairs
+        raise RuntimeError(f"Claude API error: {data}")
+    return data["content"][0]["text"]
 
 
-# ==============================================================
-# ⑤ バックテスト（日次データ取得 + グリッドサーチ）
-# ==============================================================
-def fetch_daily_prices_for_bt(symbol: str, days: int) -> Optional[dict]:
-    """
-    日次終値を {date: price} で返す
-    【改良点】
-    - リトライ回数を3→5回に増加
-    - 429(レート制限)は長めに待機（60秒）
-    - 5xx系サーバーエラーも個別ハンドリング
-    - 取得成功時にデータ件数をログ出力
-    """
-    cg_id = SYMBOL_TO_CG_ID.get(symbol.upper())
-    if not cg_id:
-        print(f"  {symbol}: CoinGecko IDが未登録")
-        return None
+# ================
+# Telegram
+# ================
 
-    url    = f"{COINGECKO_BASE}/coins/{cg_id}/market_chart"
-    params = {"vs_currency": "usd", "days": days, "interval": "daily"}
+def send_telegram(text: str) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    r = requests.post(url, data={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+    }, timeout=30)
+    r.raise_for_status()
 
-    for attempt in range(5):
+
+# ================
+# Main
+# ================
+
+def main() -> None:
+    positions = get_open_positions()
+    symbols_needed = sorted(set(UNIVERSE + [p["long_sym"] for p in positions] + [p["short_sym"] for p in positions]))
+
+    print("Fetching Bybit 4h klines...")
+    data_map: Dict[str, List[dict]] = {}
+    for sym in symbols_needed:
         try:
-            r = requests.get(url, params=params, timeout=45,
-                             headers={"Accept": "application/json"})
-
-            # レート制限（429）は長めに待機してリトライ
-            if r.status_code == 429:
-                wait = 60 + attempt * 15
-                print(f"  {symbol} レート制限(429) → {wait}秒待機してリトライ({attempt+1}/5)")
-                time.sleep(wait)
-                continue
-
-            # サーバーエラー（5xx）は短め待機でリトライ
-            if r.status_code >= 500:
-                wait = 15 + attempt * 10
-                print(f"  {symbol} サーバーエラー({r.status_code}) → {wait}秒待機({attempt+1}/5)")
-                time.sleep(wait)
-                continue
-
-            r.raise_for_status()
-            price_data = r.json().get("prices", [])
-
-            if not price_data:
-                print(f"  {symbol}: 価格データが空（attempt {attempt+1}/5）")
-                time.sleep(10)
-                continue
-
-            result = {
-                dt.datetime.utcfromtimestamp(p[0] / 1000).date(): p[1]
-                for p in price_data
-            }
-            print(f"  {symbol}: {len(result)}日分取得成功")
-            return result
-
-        except requests.exceptions.Timeout:
-            print(f"  {symbol} タイムアウト({attempt+1}/5) → 15秒待機")
-            time.sleep(15)
+            data_map[sym] = fetch_bybit_klines(sym, total_limit=2200)
+            print(f"  {sym}: {len(data_map[sym])} bars")
         except Exception as e:
-            print(f"  {symbol} 取得失敗({attempt+1}/5): {type(e).__name__}: {e}")
-            time.sleep(10 + attempt * 5)
+            print(f"  {sym}: fetch failed: {e}")
+    latest_prices = {sym: rows[-1]["close"] for sym, rows in data_map.items() if rows}
 
-    print(f"  {symbol}: 5回リトライ失敗、スキップ")
-    return None
-
-
-def run_backtest_for_pair(long_sym: str, short_sym: str) -> Optional[dict]:
-    """
-    1ペアのバックテストを実行。
-    TP × SL × エントリー条件 の全組み合わせをグリッドサーチ。
-
-    エントリー条件7種:
-      always      : 無条件（前トレード終了後に即エントリー）
-      ma_above_5  : 現在レシオ > 5日MA  （ショートが相対的に割高）
-      ma_above_10 : 現在レシオ > 10日MA
-      ma_above_20 : 現在レシオ > 20日MA
-      ma_below_5  : 現在レシオ < 5日MA  （ロングが相対的に強い ← 理論的に有利）
-      ma_below_10 : 現在レシオ < 10日MA
-      ma_below_20 : 現在レシオ < 20日MA
-
-    戻り値: {best_*, top10: [{tp,sl,entry_cond,pnl,wr,count,avg_hold}, ...]}
-    """
-    print(f"  {long_sym}/{short_sym} データ取得中...")
-    long_prices  = fetch_daily_prices_for_bt(long_sym,  BACKTEST_DAYS + 30)  # MA計算のため余裕を持たせる
-    time.sleep(8)
-    short_prices = fetch_daily_prices_for_bt(short_sym, BACKTEST_DAYS + 30)
-    time.sleep(8)
-
-    if not long_prices or not short_prices:
-        print(f"  {long_sym}/{short_sym} データ取得失敗")
-        return None
-
-    common_dates = sorted(set(long_prices) & set(short_prices))
-    if len(common_dates) < 50:   # MA20 + 最低30日の余裕
-        print(f"  {long_sym}/{short_sym} データ不足({len(common_dates)}日)")
-        return None
-
-    # 直近BACKTEST_DAYS日を対象期間とする
-    target_dates = common_dates[-BACKTEST_DAYS:]
-    all_dates    = common_dates  # MA計算用（より古いデータも使う）
-
-    ratios_all = [short_prices[d] / long_prices[d] for d in all_dates]
-    # target_datesに対応するインデックスのオフセット
-    offset = len(all_dates) - len(target_dates)
-
-    # MA計算（all_datesベース）
-    def get_ma(idx_in_all: int, window: int) -> Optional[float]:
-        """idx_in_all時点でのwindow日移動平均。データ不足ならNone"""
-        start = idx_in_all - window + 1
-        if start < 0:
-            return None
-        return sum(ratios_all[start:idx_in_all + 1]) / window
-
-    # エントリー条件の定義
-    # (条件名, 判定関数(ratio, ma) -> bool, MAウィンドウ)
-    ENTRY_CONDITIONS = [
-        ("always",      lambda r, ma: True,  None),
-        ("ma_above_5",  lambda r, ma: ma is not None and r > ma,  5),
-        ("ma_above_10", lambda r, ma: ma is not None and r > ma, 10),
-        ("ma_above_20", lambda r, ma: ma is not None and r > ma, 20),
-        ("ma_below_5",  lambda r, ma: ma is not None and r < ma,  5),
-        ("ma_below_10", lambda r, ma: ma is not None and r < ma, 10),
-        ("ma_below_20", lambda r, ma: ma is not None and r < ma, 20),
-    ]
-
-    ratios = ratios_all[offset:]   # target_dates に対応するレシオ列
-    n      = len(ratios)
-    MAX_HOLD = 30
-
-    results = []
-    total_patterns = len(TP_RANGE) * len(SL_RANGE) * len(ENTRY_CONDITIONS)
-    print(f"  グリッドサーチ: {total_patterns}パターン")
-
-    for (cond_name, cond_fn, ma_window), tp, sl in itertools.product(
-            ENTRY_CONDITIONS, TP_RANGE, SL_RANGE):
-
-        trades = []   # (pnl, hold_days)
-        i = 0
-        while i < n - 1:
-            # エントリー条件チェック
-            idx_in_all = offset + i
-            ma = get_ma(idx_in_all, ma_window) if ma_window else None
-            current_ratio = ratios[i]
-
-            if not cond_fn(current_ratio, ma):
-                i += 1   # 条件不成立 → 翌日へ
-                continue
-
-            # エントリー成立 → TP/SL到達まで保有
-            entry_r  = ratios[i]
-            tp_level = entry_r * (1 - tp / 100)
-            sl_level = entry_r * (1 + sl / 100)
-            hold     = min(MAX_HOLD, n - 1 - i)
-            exit_r   = ratios[min(i + MAX_HOLD, n - 1)]
-
-            for j in range(i + 1, min(i + 1 + MAX_HOLD, n)):
-                cur = ratios[j]
-                if cur <= tp_level or cur >= sl_level:
-                    hold   = j - i
-                    exit_r = cur
-                    break
-
-            pnl = -(exit_r - entry_r) / entry_r * POSITION_SIZE
-            trades.append((pnl, hold))
-            i += hold + 1   # 決済翌日から次のエントリー機会を探す
-
-        if len(trades) < 5:   # サンプル数が少なすぎるものは除外
+    # 保有中判定
+    pos_out = []
+    for p in positions:
+        if p["long_sym"] not in data_map or p["short_sym"] not in data_map:
             continue
-
-        pnls      = [t[0] for t in trades]
-        hold_days = [t[1] for t in trades]
-        total     = round(sum(pnls), 2)
-        wr        = round(sum(1 for x in pnls if x > 0) / len(pnls) * 100, 1)
-        avg_hold  = round(sum(hold_days) / len(hold_days), 1)
-        results.append({
-            "tp": tp, "sl": sl, "entry_cond": cond_name,
-            "pnl": total, "wr": wr, "count": len(trades), "avg_hold": avg_hold,
+        pnl = calc_position_pnl(p, latest_prices)
+        ts, strong, ratio = align_ratio_series(data_map[p["long_sym"]], data_map[p["short_sym"]])
+        weak_px = np.array([r["close"] for r in data_map[p["short_sym"]]][-len(strong):])
+        corr = calc_corr180(strong, weak_px)
+        metrics = calc_ratio_metrics(ts, strong, ratio)
+        s_health = strong_health(p["long_sym"], data_map)
+        action_hold, dca_ok, reason = decide_hold_action(p, pnl["total_pnl"], metrics, s_health)
+        pos_out.append({
+            "pair": f"{p['long_sym']}/{p['short_sym']}",
+            "strong": p["long_sym"],
+            "weak": p["short_sym"],
+            "action_hold": action_hold,
+            "hold_reason": reason,
+            "dca_ok": dca_ok,
+            "corr180": round(corr, 3) if not math.isnan(corr) else None,
+            "ratio_ret_4h": metrics["ratio_ret_4h"],
+            "ratio_ret_1d": metrics["ratio_ret_1d"],
+            "ma90_mult": metrics["ma90_mult"],
+            "spike_count_12m": metrics["spike_count_12m"],
+            "spike_grade": spike_grade(metrics["spike_count_12m"], metrics["max_runup_12m"]),
+            "strong_health": s_health,
+            "total_pnl": pnl["total_pnl"],
+            "long_current": pnl["long_current"],
+            "short_current": pnl["short_current"],
+            "dca_trigger_4h": max(SPIKE_FLOOR, SPIKE_K * metrics["atr_pct_ratio_14"]) if not math.isnan(metrics["atr_pct_ratio_14"]) else None,
         })
 
-    if not results:
-        return None
+    # 新規候補
+    candidates = []
+    active_pairs = {(p["long_sym"], p["short_sym"]) for p in positions}
+    for strong_sym in LONG_CANDIDATES:
+        if strong_sym not in data_map:
+            continue
+        s_health = strong_health(strong_sym, data_map)
+        for weak_sym in SHORT_CANDIDATES:
+            if weak_sym == strong_sym or weak_sym not in data_map:
+                continue
+            if (strong_sym, weak_sym) in active_pairs:
+                continue
+            try:
+                ts, strong, ratio = align_ratio_series(data_map[strong_sym], data_map[weak_sym])
+                weak_px = np.array([r["close"] for r in data_map[weak_sym]][-len(strong):])
+                corr = calc_corr180(strong, weak_px)
+                metrics = calc_ratio_metrics(ts, strong, ratio)
+                action_new, s_grade = decide_new_action(metrics, corr, s_health)
+                bt = backtest_ratio_grid(ratio)
+                candidates.append({
+                    "pair": f"{strong_sym}/{weak_sym}",
+                    "strong": strong_sym,
+                    "weak": weak_sym,
+                    "action_new": action_new,
+          decide_new_action(metrics, corr, s_health)
+                bt = backtest_ratio_grid(ratio)
+                candidates.append({
+                    "pair": f"{strong_sym}/{weak_sym}",
+                    "strong": strong_sym,
+                    "weak": weak_sym,
+                    "action_new": action_new,
+                    "corr180": round(corr, 3) if not math.isnan(corr) else None,
+                    "ratio_ret_4h": metrics["ratio_ret_4h"],
+                    "ratio_ret_1d": metrics["ratio_ret_1d"],
+                    "spike_grade": s_grade,
+                    "spike_count_12m": metrics["spike_count_12m"],
+                    "strong_health": s_health,
+                    "ma90_mult": metrics["ma90_mult"],
+                    "backtest_best": bt["best"],
+                })
+            except Exception as e:
+                print(f"candidate failed {strong_sym}/{weak_sym}: {e}")
+    # ENTER優先、次にWAIT
+    rank = {"ENTER": 0, "WAIT": 1, "SKIP": 2}
+    candidates = sorted(
+        candidates,
+        key=lambda x: (
+            rank.get(x["action_new"], 9),
+            9 if x["spike_grade"] == "AVOID" else (1 if x["spike_grade"] == "WATCH" else 0),
+            -(x["ratio_ret_1d"] if x["ratio_ret_1d"] is not None else -999),
+        )
+    )[:12]
 
-    results.sort(key=lambda x: x["pnl"], reverse=True)
-    best = results[0]
-    print(f"  最適: {best['entry_cond']} TP{best['tp']}% SL{best['sl']}% "
-          f"勝率{best['wr']}% ${best['pnl']} {best['count']}回 avg{best['avg_hold']}日")
-
-    # 勝率70%以上のパターン数をログ出力
-    qualified_count = sum(1 for r in results if r["wr"] >= 70.0)
-    print(f"  勝率70%以上: {qualified_count}パターン / {len(results)}パターン中")
-
-    return {
-        "best": best,                  # 全体最良（勝率条件なし）
-        "all_results": results,        # 全パターン（format側でフィルタリング）
-        # write_backtest_result用に best の値をフラットにも持つ
-        "best_tp":       best["tp"],
-        "best_sl":       best["sl"],
-        "best_entry":    best["entry_cond"],
-        "best_pnl":      best["pnl"],
-        "best_wr":       best["wr"],
-        "best_count":    best["count"],
-        "best_avg_hold": best["avg_hold"],
+    payload = {
+        "asof": utc_now_str(),
+        "positions": pos_out,
+        "new_candidates": candidates,
     }
 
-
-# ==============================================================
-# ⑥ バックテスト結果をスプレッドシートに書き込み
-# ==============================================================
-def write_backtest_result(long_sym: str, short_sym: str, result: dict):
-    try:
-        creds_dict = json.loads(GOOGLE_CREDS_JSON)
-        creds = Credentials.from_service_account_info(
-            creds_dict,
-            scopes=["https://www.googleapis.com/auth/spreadsheets"],
-        )
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(SPREADSHEET_ID)
-        try:
-            ws = sh.worksheet(BACKTEST_SHEET)
-        except gspread.exceptions.WorksheetNotFound:
-            ws = sh.add_worksheet(title=BACKTEST_SHEET, rows=500, cols=11)
-            ws.append_row([
-                "実行日時", "LONG", "SHORT",
-                "最適エントリー条件", "最適利確%", "最適損切%",
-                "過去勝率%", "総損益($)", "取引回数", "平均保有日数",
-            ])
-
-        ws.append_row([
-            dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
-            long_sym, short_sym,
-            result.get("best_entry", ""),
-            result["best_tp"], result["best_sl"],
-            result["best_wr"], result["best_pnl"],
-            result["best_count"], result.get("best_avg_hold", ""),
-        ])
-        print(f"  スプレッドシート書き込み完了: {long_sym}/{short_sym}")
-    except Exception as e:
-        print(f"  スプレッドシート書き込み失敗: {e}")
-
-
-# ==============================================================
-# ⑦ バックテスト結果のTelegram表示テキスト生成
-# ==============================================================
-def format_backtest_message(long_sym: str, short_sym: str, result: dict) -> str:
-    """
-    勝率70%以上のパターンを総損益順に上位5つ表示。
-    条件名は表示しない（どの条件でもエントリー推奨として扱う）。
-    """
-    qualified = [r for r in result["all_results"] if r["wr"] >= 70.0]
-    qualified_sorted = sorted(qualified, key=lambda x: x["pnl"], reverse=True)[:5]
-
-    if qualified_sorted:
-        lines = ""
-        for rank, r in enumerate(qualified_sorted, 1):
-            lines += (
-                f"  {rank}. TP{r['tp']}% SL{r['sl']}%"
-                f" 勝率{r['wr']}% ${r['pnl']} {r['count']}回 avg{r['avg_hold']}日\n"
-            )
-        recommend_block = f"  ✅ 推奨パターン（勝率70%以上・上位5つ）\n{lines}"
-    else:
-        recommend_block = "  ⚠️ 勝率70%以上のパターンなし\n"
-
-    # 全体の最良結果（勝率条件なし）
-    best = result["best"]
-    return (
-        f"\n📊 {long_sym}L/{short_sym}S（過去{BACKTEST_DAYS}日）\n"
-        f"  🏆 全体最適: TP{best['tp']}% / SL{best['sl']}%"
-        f" 勝率{best['wr']}% ${best['pnl']} {best['count']}回 avg{best['avg_hold']}日\n"
-        f"{recommend_block}"
-    )
-
-
-# ==============================================================
-# ⑧ Telegram通知
-# ==============================================================
-def send_telegram(message: str):
-    for chunk in [message[i:i+4000] for i in range(0, len(message), 4000)]:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": chunk},
-            timeout=10,
-        )
-        if not r.ok:
-            print(f"Telegram送信失敗: {r.text}")
-
-
-# ==============================================================
-# ⑨ メイン
-# ==============================================================
-def main():
-    now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"[{now}] 分析開始")
-
-    # 1. ポジション読み込み
-    print("スプレッドシート読み込み中...")
-    positions = get_open_positions()
-    print(f"オープンポジション: {len(positions)}件")
-
-    # 2. 価格取得
-    symbols_needed = set(LONG_CANDIDATES + SHORT_CANDIDATES)
-    for p in positions:
-        symbols_needed.update([p["long_sym"], p["short_sym"]])
-    print("価格取得中...")
-    prices = get_prices(list(symbols_needed))
-
-    # 3. 含み損益計算
-    positions_with_pnl = [calc_pnl(p, prices) for p in positions]
-
-    # 4. Claude分析（ポジション判断 + 推奨ペア取得）
-    print("Claude分析中...")
-    claude_text, recommend_pairs = analyze_with_claude(positions_with_pnl, prices)
-    print(f"推奨ペア: {recommend_pairs}")
-
-    # 5. 推奨ペアのバックテスト自動実行
-    bt_section = ""
-    if recommend_pairs:
-        print(f"バックテスト実行: {len(recommend_pairs)}ペア")
-        for pair in recommend_pairs:
-            long_sym, short_sym = pair["long"], pair["short"]
-            result = run_backtest_for_pair(long_sym, short_sym)
-            if result:
-                bt_section += format_backtest_message(long_sym, short_sym, result)
-                write_backtest_result(long_sym, short_sym, result)
-            else:
-                bt_section += f"\n⚠️ {long_sym}/{short_sym} バックテスト失敗\n"
-            time.sleep(5)  # ペア間の待機（レート制限対策）
-    else:
-        bt_section = "\n⚠️ 推奨ペアの自動抽出ができませんでした\n"
-
-    # 6. 価格スナップショット生成
-    # ポジション保有銘柄と推奨ペア銘柄を優先表示、その後LONGロング候補を表示
-    position_syms = []
-    for p in positions_with_pnl:
-        for sym in [p["long_sym"], p["short_sym"]]:
-            if sym and sym not in position_syms:
-                position_syms.append(sym)
-
-    recommend_syms = []
-    for pair in recommend_pairs:
-        for sym in [pair["long"], pair["short"]]:
-            if sym and sym not in recommend_syms and sym not in position_syms:
-                recommend_syms.append(sym)
-
-    # スナップショット表示：保有銘柄 → 推奨銘柄 → LONGロング候補
-    snapshot_lines = []
-    if position_syms:
-        snapshot_lines.append("【保有中】")
-        for sym in position_syms:
-            price = prices.get(sym)
-            snapshot_lines.append(f"  {sym}: ${price:,.4f}" if price else f"  {sym}: 取得不可")
-
-    if recommend_syms:
-        snapshot_lines.append("【推奨候補】")
-        for sym in recommend_syms:
-            price = prices.get(sym)
-            snapshot_lines.append(f"  {sym}: ${price:,.4f}" if price else f"  {sym}: 取得不可")
-
-    snapshot_lines.append("【主要銘柄】")
-    for sym in LONG_CANDIDATES:
-        if sym not in position_syms and sym not in recommend_syms:
-            price = prices.get(sym)
-            snapshot_lines.append(f"  {sym}: ${price:,.2f}" if price else f"  {sym}: 取得不可")
-
-    price_snapshot = "\n".join(snapshot_lines)
-
-    # 7. Telegram通知
-    message = (
-        f"🤖 相関両建てアドバイザー\n"
-        f"🕐 取得時刻: {now}\n"
-        f"⚠️ 通知遅延がある場合は上記時刻を基準にしてください\n"
-        f"📊 オープンポジション: {len(positions)}件\n"
-        f"━━━━━━━━━━━━\n"
-        f"💹 価格スナップショット（取得時刻基準）\n"
-        f"{price_snapshot}\n"
-        f"━━━━━━━━━━━━\n"
-        f"{claude_text}\n"
-        f"━━━━━━━━━━━━\n"
-        f"🔬 新規推奨ペア バックテスト結果\n"
-        f"{bt_section}\n"
-        f"━━━━━━━━━━━━\n"
-        f"💡 取引はご自身の判断で実行してください"
-    )
-
-    print("Telegram通知送信中...")
-    send_telegram(message)
-    print("完了！")
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    text = render_with_claude(payload)
+    send_telegram(text)
 
 
 if __name__ == "__main__":
