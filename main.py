@@ -300,8 +300,7 @@ def analyze_with_claude(positions_with_pnl: list, prices: dict) -> tuple:
       → アルト全面高・BTC下落局面では推奨禁止
    B. ショート候補が明確に弱い根拠がある
       → 「なんとなく弱そう」は禁止。セクター・ファンダ・需給で具体的に説明できること
-   C. 既存ポジションと同じSHORT銘柄のペアは追加しない（集中リスク回避）
-   D. ゾンビ銘柄({zombie_list})をショートに使わない
+   C. ゾンビ銘柄({zombie_list})をショートに使わない
 
    条件を満たすペアがあれば以下の形式で出力（最大2個まで）：
    RECOMMEND: LONG=BTC SHORT=DOT
@@ -532,9 +531,9 @@ def run_backtest_for_pair(long_sym: str, short_sym: str) -> Optional[dict]:
     print(f"  最適: {best['entry_cond']} TP{best['tp']}% SL{best['sl']}% "
           f"勝率{best['wr']}% ${best['pnl']} {best['count']}回 avg{best['avg_hold']}日")
 
-    # 勝率80%以上のパターン数をログ出力
-    qualified_count = sum(1 for r in results if r["wr"] >= 80.0)
-    print(f"  勝率80%以上: {qualified_count}パターン / {len(results)}パターン中")
+    # 勝率70%以上のパターン数をログ出力
+    qualified_count = sum(1 for r in results if r["wr"] >= 70.0)
+    print(f"  勝率70%以上: {qualified_count}パターン / {len(results)}パターン中")
 
     return {
         "best": best,                  # 全体最良（勝率条件なし）
@@ -590,10 +589,10 @@ def write_backtest_result(long_sym: str, short_sym: str, result: dict):
 # ==============================================================
 def format_backtest_message(long_sym: str, short_sym: str, result: dict) -> str:
     """
-    勝率80%以上のパターンを総損益順に上位5つ表示。
+    勝率70%以上のパターンを総損益順に上位5つ表示。
     条件名は表示しない（どの条件でもエントリー推奨として扱う）。
     """
-    qualified = [r for r in result["all_results"] if r["wr"] >= 80.0]
+    qualified = [r for r in result["all_results"] if r["wr"] >= 70.0]
     qualified_sorted = sorted(qualified, key=lambda x: x["pnl"], reverse=True)[:5]
 
     if qualified_sorted:
@@ -603,9 +602,9 @@ def format_backtest_message(long_sym: str, short_sym: str, result: dict) -> str:
                 f"  {rank}. TP{r['tp']}% SL{r['sl']}%"
                 f" 勝率{r['wr']}% ${r['pnl']} {r['count']}回 avg{r['avg_hold']}日\n"
             )
-        recommend_block = f"  ✅ 推奨パターン（勝率80%以上・上位5つ）\n{lines}"
+        recommend_block = f"  ✅ 推奨パターン（勝率70%以上・上位5つ）\n{lines}"
     else:
-        recommend_block = "  ⚠️ 勝率80%以上のパターンなし\n"
+        recommend_block = "  ⚠️ 勝率70%以上のパターンなし\n"
 
     # 全体の最良結果（勝率条件なし）
     best = result["best"]
