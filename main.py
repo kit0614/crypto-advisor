@@ -559,13 +559,6 @@ def main() -> None:
                     "strong": strong_sym,
                     "weak": weak_sym,
                     "action_new": action_new,
-          decide_new_action(metrics, corr, s_health)
-                bt = backtest_ratio_grid(ratio)
-                candidates.append({
-                    "pair": f"{strong_sym}/{weak_sym}",
-                    "strong": strong_sym,
-                    "weak": weak_sym,
-                    "action_new": action_new,
                     "corr180": round(corr, 3) if not math.isnan(corr) else None,
                     "ratio_ret_4h": metrics["ratio_ret_4h"],
                     "ratio_ret_1d": metrics["ratio_ret_1d"],
