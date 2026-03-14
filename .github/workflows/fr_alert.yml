@@ -2,8 +2,8 @@ name: FR差アービトラージ通知（毎時45分）
 
 on:
   schedule:
-    # 毎時45分に実行（UTC36分 = JST45分）
-    - cron: '36 * * * *'
+    # 毎時30分に実行（UTC36分 = JST45分）
+    - cron: '21 * * * *'
   workflow_dispatch:  # 手動実行ボタン付き
 
 jobs:
